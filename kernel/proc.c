@@ -686,3 +686,69 @@ procdump(void)
     printf("\n");
   }
 }
+
+int alloc_kswapd(uint64 start, void *chan)
+{
+  struct proc *p;
+
+  for(p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if(p->state == UNUSED) {
+      goto found;
+    } else {
+      release(&p->lock);
+    }
+  }
+  return -1;
+
+found:
+  p->pid = allocpid();
+  p->state = SLEEPING;
+
+  // Allocate a trapframe page.
+  if((p->trapframe = (struct trapframe *)kalloc()) == 0){
+    freeproc(p);
+    release(&p->lock);
+    return -1;
+  }
+
+  // An empty user page table.
+  p->pagetable = proc_pagetable(p);
+  if(p->pagetable == 0){
+    freeproc(p);
+    release(&p->lock);
+    return -1;
+  }
+
+  // Set up new context to start executing at forkret,
+  // which returns to user space.
+  memset(&p->context, 0, sizeof(p->context));
+  p->context.ra = start;
+  p->context.sp = p->kstack + PGSIZE;
+
+  p->chan = chan;
+
+  release(&p->lock);
+  return p->pid;
+}
+
+void
+sleep_kswapd(int pid)
+{
+  struct proc *p = &proc[pid];
+  acquire(&p->lock);  //DOC: sleeplock1
+  // Go to sleep.
+  p->state = SLEEPING; // SLEEPING
+  sched();
+  // Reacquire original lock.
+  release(&p->lock);
+}
+
+void
+wakeup_kswapd(int pid)
+{
+  struct proc *p = &proc[pid];
+  acquire(&p->lock);
+  p->state = RUNNABLE;
+  release(&p->lock);
+}
