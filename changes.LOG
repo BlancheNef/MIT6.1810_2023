@@ -1,0 +1,177 @@
+diff --git a/Makefile b/Makefile
+index 8e74f52..0593720 100644
+--- a/Makefile
++++ b/Makefile
+@@ -188,6 +188,7 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_symlinktest
+ 
+diff --git a/kernel/defs.h b/kernel/defs.h
+index a3c962b..4b82fc2 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -80,6 +80,7 @@ int             pipewrite(struct pipe*, uint64, int);
+ void            printf(char*, ...);
+ void            panic(char*) __attribute__((noreturn));
+ void            printfinit(void);
++void            backtrace(void);
+ 
+ // proc.c
+ int             cpuid(void);
+diff --git a/kernel/fcntl.h b/kernel/fcntl.h
+index 44861b9..e5e38e3 100644
+--- a/kernel/fcntl.h
++++ b/kernel/fcntl.h
+@@ -3,3 +3,4 @@
+ #define O_RDWR    0x002
+ #define O_CREATE  0x200
+ #define O_TRUNC   0x400
++#define O_NOFOLLOW 0x800
+
+diff --git a/kernel/stat.h b/kernel/stat.h
+index 19543af..872e75a 100644
+--- a/kernel/stat.h
++++ b/kernel/stat.h
+@@ -1,6 +1,7 @@
+ #define T_DIR     1   // Directory
+ #define T_FILE    2   // File
+ #define T_DEVICE  3   // Device
++#define T_SYMLINK 4   // symbol link
+ 
+ struct stat {
+   int dev;     // File system's disk device
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index ed65409..ab84600 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,6 +101,7 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_symlink(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +127,7 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_symlink] sys_symlink
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..13818da 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_symlink 22
+diff --git a/kernel/sysfile.c b/kernel/sysfile.c
+index 16b668c..d5749f6 100644
+--- a/kernel/sysfile.c
++++ b/kernel/sysfile.c
+@@ -256,7 +256,9 @@ create(char *path, short type, short major, short minor)
+   if((ip = dirlookup(dp, name, 0)) != 0){
+     iunlockput(dp);
+     ilock(ip);
+-    if(type == T_FILE && (ip->type == T_FILE || ip->type == T_DEVICE))
++    if(type == T_FILE && (ip->type == T_FILE || ip->type == T_DEVICE)) 
++      return ip;
++    if(type ==T_SYMLINK && ip->type == T_SYMLINK) // exits already, do not create.
+       return ip;
+     iunlockput(ip);
+     return 0;
+@@ -341,6 +343,28 @@ sys_open(void)
+     return -1;
+   }
+ 
++  const int  max_dep = 10;
++  int dep = 0;
++  char sym_path[MAXPATH];
++  while(ip->type == T_SYMLINK){
++    if(dep > max_dep) {
++      iunlockput(ip);
++      end_op();
++      return -1;
++    }
++    dep++;
++    if(omode & O_NOFOLLOW)
++      break;
++    readi(ip, 0, (uint64)sym_path, 0, MAXPATH);
++    iunlockput(ip);
++    if((ip = namei(sym_path)) == 0){
++      end_op();
++      return -1;
++    }
++    ilock(ip);
++  }
++
++
+   if((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0){
+     if(f)
+       fileclose(f);
+@@ -503,3 +527,36 @@ sys_pipe(void)
+   }
+   return 0;
+ }
++
++uint64
++sys_symlink(void)
++{
++  char target[MAXPATH], path[MAXPATH];
++  struct inode *ip;
++
++  if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
++    return -1;
++
++  begin_op();
++
++  // Note that target does not need to exist for the system call to succeed.
++  if((ip = create(path, T_SYMLINK, 0, 0)) == 0) {
++    end_op();
++    return -1;
++  }
++
++  // create return a locked ip;
++  // write the target
++  if(writei(ip, 0, (uint64)target, 0, MAXPATH) < MAXPATH) {
++    // error
++    ip->nlink = 0;
++    iunlockput(ip);
++    end_op();
++  }
++
++  iupdate(ip);
++  iunlockput(ip);
++  end_op();
++
++  return 0;
++}
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index 4d398d5..4df8ac4 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -22,6 +22,7 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int symlink(char *target, char *path);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..65a8d6b 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,4 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("symlink");
+\ No newline at end of file

@@ -341,6 +341,28 @@ sys_open(void)
     return -1;
   }
 
+  const int  max_dep = 10;
+  int dep = 0;
+  char sym_path[MAXPATH];
+  while(ip->type == T_SYMLINK){
+    if(dep > max_dep) {
+      iunlockput(ip);
+      end_op();
+      return -1;
+    }
+    dep++;
+    if(omode & O_NOFOLLOW)
+      break;
+    readi(ip, 0, (uint64)sym_path, 0, MAXPATH);
+    iunlockput(ip);
+    if((ip = namei(sym_path)) == 0){
+      end_op();
+      return -1;
+    }
+    ilock(ip);
+  }
+
+
   if((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0){
     if(f)
       fileclose(f);
@@ -502,4 +524,64 @@ sys_pipe(void)
     return -1;
   }
   return 0;
+}
+
+uint64
+sys_symlink(void)
+{
+  char target[MAXPATH], path[MAXPATH];
+  char name[DIRSIZ];
+  struct inode *ip, *dp;
+
+  if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
+    return -1;
+
+  begin_op();
+
+  if((dp = nameiparent(path, name)) == 0) {
+    end_op();
+    return -1;
+  }
+    
+
+  ilock(dp);
+
+  if((ip = dirlookup(dp, name, 0)) != 0){
+    iunlockput(dp);
+    iput(ip);
+    end_op();
+    return -1;
+  }
+
+  if((ip = ialloc(dp->dev, T_SYMLINK)) == 0){
+    iunlockput(dp);
+    end_op();
+    return -1;
+  }
+
+  ilock(ip);
+  ip->major = 0;
+  ip->minor = 0;
+  ip->nlink = 1;
+
+  if(writei(ip, 0, (uint64)target, 0, strlen(target) + 1) < strlen(target) + 1)
+    goto fail;
+
+  if(dirlink(dp, name, ip->inum) < 0)
+    goto fail;
+
+  iunlockput(dp);
+  iupdate(ip);
+  iunlockput(ip);
+  end_op();
+
+  return 0;
+
+fail:
+  // something went wrong. de-allocate ip.
+  ip->nlink = 0;
+  iunlockput(ip);
+  iunlockput(dp);
+  end_op();
+  return -1;
 }
