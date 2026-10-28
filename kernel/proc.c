@@ -124,6 +124,7 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  p->vma_head = -1;
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -312,6 +313,8 @@ fork(void)
 
   pid = np->pid;
 
+  fork_vma(p, np);
+
   release(&np->lock);
 
   acquire(&wait_lock);
@@ -359,6 +362,12 @@ exit(int status)
       p->ofile[fd] = 0;
     }
   }
+
+  // freevma
+  // must free here because fileclose may call wakeup(when release buf's sleeplock)
+  // when wakeup, must not hold child proc's lock
+  if(p->pagetable)
+    uvmfreevma(p);
 
   begin_op();
   iput(p->cwd);

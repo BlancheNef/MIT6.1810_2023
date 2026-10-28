@@ -315,7 +315,6 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -323,12 +322,16 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
+    // 1. W = 1 -> W = 0, C = 1.
+    // 2. W = 0, C = 0 -> W = 0, C = 0.
+    // 3. W = 0, C = 1 -> W = 0, C = 1. 
+    if((*pte & PTE_W)) {
+      *pte &= ~PTE_W;
+      *pte |= PTE_C;
+    }
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+    add_page_ref_count(pa, 1);
+    if(mappages(new, i, PGSIZE, (uint64)pa, flags) != 0){
       goto err;
     }
   }
@@ -366,9 +369,15 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     if(va0 >= MAXVA)
       return -1;
     pte = walk(pagetable, va0, 0);
-    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0 ||
-       (*pte & PTE_W) == 0)
+    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
       return -1;
+        if((*pte & PTE_W) == 0) {
+      if(*pte & PTE_C) {
+        handle_copy_on_write(va0, pagetable);
+      } else {
+        return -1;
+      }
+    }
     pa0 = PTE2PA(*pte);
     n = PGSIZE - (dstva - va0);
     if(n > len)
@@ -448,4 +457,50 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+int 
+handle_copy_on_write(uint64 va, pagetable_t pagetable)
+{
+  if (va >= MAXVA) {
+    return -1;
+  }
+  va = PGROUNDDOWN(va);
+  pte_t* pte = walk(pagetable, va, 0);
+
+  if((*pte & PTE_U) == 0) {
+    // try to write a kernel page!
+    return -1;
+  }
+
+  if((*pte & PTE_V) == 0) {
+    // try to write a invalid page!
+    return -1;
+  }
+
+  if((*pte & PTE_C) == 0) {
+    // NOT A COW PAGE!
+    return -1;
+  }
+  uint64 pa = PTE2PA(*pte);
+  int flags = PTE_FLAGS(*pte);
+  uint64 mem = pa;
+  if(get_page_ref_count(pa) > 1){
+    if((mem = (uint64)kalloc()) == 0) {
+      return -1; // memory not enough
+    }
+
+    // move firt then unmap to avoid data race!
+    memmove((char*)mem, (char*)pa, PGSIZE);
+    uvmunmap(pagetable, va, 1, 1);
+
+    flags &= ~PTE_C;
+    flags |= PTE_W;
+    // in-suit revise pte
+    *pte = PA2PTE(mem) | flags;
+  } else {
+    *pte &= ~PTE_C;
+    *pte |= PTE_W;
+  }
+  return 0;
 }
