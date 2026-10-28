@@ -33,7 +33,7 @@ int on_demand_page(struct proc* p, uint64 va){
   }
 
   va = PGROUNDDOWN(va);
-  int off = va - p->vma[index].start;
+  int off = va - p->vma[index].off_start;
   ilock(p->vma[index].file->ip);
   // readi may not return PGSIZE because off + PGSIZE > file->size
   int read_size = readi(p->vma[index].file->ip, 0, pa, off, PGSIZE);
@@ -59,13 +59,28 @@ int on_demand_page(struct proc* p, uint64 va){
     return -1;
   }
 
-  printf("pid: %d, map %p to %p\n", p->pid, va, pa);
+  // printf("pid: %d, map %p to %p\n", p->pid, va, pa);
   
   return 0;
 }
 
+int write_page_fault(struct proc* p, uint64 va)
+{
+  if (va >= MAXVA) {
+    return -1;
+  }
+  va = PGROUNDDOWN(va);
+  pte_t* pte = walk(p->pagetable, va, 0);
+  if(pte == 0 || (*pte & PTE_V) == 0) {
+    // need page in!
+    return on_demand_page(p, va);
+  } else {
+    return handle_copy_on_write(va, p->pagetable);
+  }
+}
+
 void freevma(struct proc* p, int index, uint64 start, uint64 end){
-    int n = (end - start) / PGSIZE;
+    int n = PGROUNDUP(end - start) / PGSIZE;
     for(int i=0; i<n; i++){
       uint64 va = start+i*PGSIZE;
       pte_t* pte = walk(p->pagetable, va, 0);
@@ -73,7 +88,7 @@ void freevma(struct proc* p, int index, uint64 start, uint64 end){
         if(p->vma[index].flag & MAP_SHARED) {
           if(*pte & PTE_D) {
             uint64 pa = PTE2PA(*pte);
-            int off = va - start;
+            int off = va - p->vma[index].off_start;
             begin_op();
             ilock(p->vma[index].file->ip);
             writei(p->vma[index].file->ip, 0, pa, off, PGSIZE);
@@ -83,7 +98,7 @@ void freevma(struct proc* p, int index, uint64 start, uint64 end){
           }
         }
         uvmunmap(p->pagetable, start+i*PGSIZE, 1, 1);
-        printf("pid: %d, unmap %p\n", p->pid, start+i*PGSIZE);
+        // printf("pid: %d, unmap %p\n", p->pid, start+i*PGSIZE);
       }
     }
 }
@@ -114,6 +129,7 @@ void fork_vma(struct proc* parent, struct proc* child) {
     child->vma[index].prev = parent->vma[index].prev;
     child->vma[index].next = parent->vma[index].next;
     child->vma[index].file = parent->vma[index].file;
+    child->vma[index].off_start = parent->vma[index].off_start;
     filedup(parent->vma[index].file);
 
     uint64 start = parent->vma[index].start;
@@ -122,7 +138,7 @@ void fork_vma(struct proc* parent, struct proc* child) {
     for(int i=0; i<n; i++){
       uint64 va = start+i*PGSIZE;
       pte_t* pte = walk(parent->pagetable, va, 0);
-      if(*pte & PTE_V){
+      if(pte != 0 && (*pte & PTE_V)){
         uint64 pa = PTE2PA(*pte);
         // 1. W = 1 -> W = 0, C = 1.
         // 2. W = 0, C = 0 -> W = 0, C = 0.
@@ -132,8 +148,8 @@ void fork_vma(struct proc* parent, struct proc* child) {
           *pte |= PTE_C;
         }
         add_page_ref_count(pa, 1);
-        mappages(child->pagetable, va, PGSIZE, (uint64)pa, PTE_FLAGS(*pte));
-        printf("atfork, pid: %d, map %p to %p\n", child->pid, va, pa);
+        mappages(child->pagetable, va, PGSIZE, (uint64)pa, PTE_FLAGS(*pte) & ~PTE_D); // clear Dirty bit
+        // printf("atfork, pid: %d, map %p to %p\n", child->pid, va, pa);
       }
     }
     child->vma[index].valid = 1;
@@ -159,6 +175,8 @@ sys_mmap(void)
     if(!(flag & MAP_PRIVATE))
       return 0xffffffffffffffff;
   }
+
+  len = PGROUNDUP(len);
 
   int free_slot = -1;
   int index = p->vma_head;
@@ -199,6 +217,7 @@ sys_mmap(void)
   p->vma[free_slot].file = f;
   p->vma[free_slot].prot = prot;
   p->vma[free_slot].flag = flag;
+  p->vma[free_slot].off_start = p->vma[free_slot].start;
 
   p->vma[free_slot].valid = 1; 
 
@@ -215,6 +234,10 @@ sys_munmap(void)
   int len;
   argaddr(0, &addr);
   argint(1, &len);
+
+  if(addr % PGSIZE != 0){
+    return -1;
+  }
 
   struct proc *p = myproc();
 
@@ -237,7 +260,16 @@ sys_munmap(void)
     fileclose(p->vma[index].file);
     p->vma[index].valid = 0;
     if(p->vma_head == index) {
+      if(p->vma[index].next != -1) {
+        p->vma[p->vma[index].next].prev = -1;
+      }
       p->vma_head = p->vma[index].next;
+    } else if (p->vma[index].next == -1) {
+      // tail but not head
+      p->vma[p->vma[index].prev].next = -1;
+    } else {
+      p->vma[p->vma[index].prev].next = p->vma[index].next;
+      p->vma[p->vma[index].next].prev = p->vma[index].prev;
     }
   } else if (addr == p->vma[index].start) {
     p->vma[index].start += len; 

@@ -252,5 +252,6 @@ void            sockrecvudp(struct mbuf*, uint32, uint16, uint16);
 
 // sysmmap.c
 int             on_demand_page(struct proc* p, uint64 addr);
+int             write_page_fault(struct proc* p, uint64 va);
 void            uvmfreevma(struct proc* p);
 void            fork_vma(struct proc* parent, struct proc* child);

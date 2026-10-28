@@ -75,9 +75,7 @@ usertrap(void)
     if (scause == 13L) {
       err = on_demand_page(p, stval);
     } else if (scause == 15L) {
-      if (handle_copy_on_write(stval, p->pagetable) == 0) {
-        err = 0;
-      }
+      err = write_page_fault(p, stval);
     } 
     if(err) {
       printf("usertrap(): unexpected scause %p pid=%d\n", scause, p->pid);

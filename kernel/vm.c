@@ -373,7 +373,10 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
       return -1;
         if((*pte & PTE_W) == 0) {
       if(*pte & PTE_C) {
-        handle_copy_on_write(va0, pagetable);
+        // ERROR: copyout may need on_demand_page_in! It is too complicated.
+        if(handle_copy_on_write(va0, pagetable) != 0) {
+          return -1;
+        }
       } else {
         return -1;
       }
@@ -383,6 +386,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     if(n > len)
       n = len;
     memmove((void *)(pa0 + (dstva - va0)), src, n);
+    *pte |= PTE_D;   // set PTE_D manually when copypout
 
     len -= n;
     src += n;
@@ -470,11 +474,6 @@ handle_copy_on_write(uint64 va, pagetable_t pagetable)
 
   if((*pte & PTE_U) == 0) {
     // try to write a kernel page!
-    return -1;
-  }
-
-  if((*pte & PTE_V) == 0) {
-    // try to write a invalid page!
     return -1;
   }
 
